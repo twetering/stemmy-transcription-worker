@@ -1,7 +1,8 @@
 {
   "input": {
-    "audio_url": "https://example.com/test.mp3",
-    "item_id": "test-123",
-    "batch_size": 16
+    "audio_url": "https://castopod.hku.nl/audio/@HKUenAI/muamer-tabakovic-ai-in-archtectuur-en-design.mp3",
+    "item_id": "benchmark-hku-kunstmatig-001",
+    "beam_size": 5,
+    "language": "nl"
   }
 }

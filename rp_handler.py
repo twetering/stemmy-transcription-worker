@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-RunPod Serverless handler: WhisperX transcription → AssemblyAI format.
+RunPod Serverless: faster-whisper transcription → AssemblyAI format.
+Geen WhisperX, geen PyTorch – alleen CTranslate2.
 
-Input:  {"audio_url": "...", "item_id": "..."} or {"audio_base64": "...", "item_id": "..."}
+Input:  {"audio_url": "...", "item_id": "..."} of {"audio_base64": "...", "item_id": "..."}
 Output: {"text", "words", "utterances", "language_code", "item_id"}
 """
 
@@ -12,27 +13,35 @@ from pathlib import Path
 
 
 def _to_assemblyai_words(segments, default_speaker="A"):
-    """Convert WhisperX segments to AssemblyAI words (ms, text, speaker, confidence)."""
+    """Convert faster-whisper segments naar AssemblyAI words."""
     words = []
     for seg in segments:
-        w = seg.get("word") or seg.get("text", "")
-        if not w:
-            continue
-        start_ms = int(float(seg.get("start", 0) or 0) * 1000)
-        end_ms = int(float(seg.get("end", 0) or 0) * 1000)
-        conf = seg.get("score") or seg.get("confidence", 0.9)
-        words.append({
-            "text": w.strip(),
-            "start": start_ms,
-            "end": end_ms,
-            "speaker": seg.get("speaker", default_speaker),
-            "confidence": float(conf) if conf is not None else 0.9,
-        })
+        seg_words = getattr(seg, "words", None) or []
+        if seg_words:
+            for w in seg_words:
+                if not w.word.strip():
+                    continue
+                words.append({
+                    "text": w.word.strip(),
+                    "start": int(w.start * 1000),
+                    "end": int(w.end * 1000),
+                    "speaker": default_speaker,
+                    "confidence": getattr(w, "probability", 0.9) or 0.9,
+                })
+        elif seg.text.strip():
+            # Fallback: segment-level als geen word timestamps
+            words.append({
+                "text": seg.text.strip(),
+                "start": int(seg.start * 1000),
+                "end": int(seg.end * 1000),
+                "speaker": default_speaker,
+                "confidence": 0.9,
+            })
     return words
 
 
 def _words_to_utterances(words):
-    """Group consecutive words with same speaker into utterances."""
+    """Group words into utterances (zelfde speaker)."""
     if not words:
         return []
     utterances = []
@@ -81,53 +90,23 @@ def _download_audio(url, out_path):
 
 
 def _transcribe(audio_path, batch_size=16):
-    import whisperx
-    import gc
-    import torch
+    from faster_whisper import WhisperModel
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    compute_type = "float16" if device == "cuda" else "float32"
-
-    model = whisperx.load_model(
+    model = WhisperModel(
         "large-v3-turbo",
-        device,
-        compute_type=compute_type,
-        asr_options={"suppress_numerals": True},
+        device="cuda",
+        compute_type="float16",
     )
-    audio = whisperx.load_audio(str(audio_path))
-    if audio is None or len(audio) == 0:
-        return {"text": "", "words": [], "utterances": [], "language_code": "nl"}
+    segments, info = model.transcribe(
+        str(audio_path),
+        batch_size=batch_size,
+        word_timestamps=True,
+        suppress_numerals=True,
+    )
+    segments = list(segments)
 
-    result = model.transcribe(audio, batch_size=batch_size)
-    del model
-    gc.collect()
-    if device == "cuda":
-        torch.cuda.empty_cache()
-
-    if not result.get("segments"):
-        return {"text": "", "words": [], "utterances": [], "language_code": "nl"}
-
-    lang = result.get("language", "nl")
-    align_model, metadata = whisperx.load_align_model(lang, device)
-    result = whisperx.align(result["segments"], align_model, metadata, audio, device)
-    del align_model
-    gc.collect()
-    if device == "cuda":
-        torch.cuda.empty_cache()
-
-    segments = []
-    for seg in result.get("segments", []):
-        for w in seg.get("words", []) or []:
-            word = w.get("word", "").strip()
-            if not word:
-                continue
-            segments.append({
-                "word": word,
-                "start": w.get("start", seg.get("start", 0)),
-                "end": w.get("end", seg.get("end", 0)),
-                "score": w.get("score"),
-                "speaker": "A",
-            })
+    if not segments:
+        return {"text": "", "words": [], "utterances": [], "language_code": info.language or "nl"}
 
     words = _to_assemblyai_words(segments)
     full_text = " ".join(w["text"] for w in words)
@@ -135,7 +114,7 @@ def _transcribe(audio_path, batch_size=16):
         "text": full_text,
         "words": words,
         "utterances": _words_to_utterances(words),
-        "language_code": lang,
+        "language_code": info.language or "nl",
     }
 
 

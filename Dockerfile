@@ -1,20 +1,23 @@
-# RunPod Serverless: WhisperX transcription worker
-# GPU required (L4 / RTX 4090)
+# RunPod Serverless: faster-whisper only – geen WhisperX, geen PyTorch
+# ~5GB i.p.v. 15GB
 
-FROM runpod/pytorch:1.0.3-cu1281-torch290-ubuntu2204
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 
 ENV PYTHONUNBUFFERED=1
+ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
 
-# FFmpeg for audio loading
-RUN apt-get update -y && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
+# Python, ffmpeg, pkg-config (voor PyAV/av)
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-dev \
+    ffmpeg \
+    pkg-config libavformat-dev libavcodec-dev libavutil-dev libswresample-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN ln -sf python3 /usr/bin/python && pip install --no-cache-dir --upgrade pip
 
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
-
-# Fix: whisperx 3.8+ requires transformers>=4.48 (Pipeline removed there)
-# Pin transformers 4.36 for Pipeline; do NOT reinstall torchvision (breaks torch pairing)
-RUN pip install --no-cache-dir "transformers==4.36.2"
 
 COPY rp_handler.py /app/
 

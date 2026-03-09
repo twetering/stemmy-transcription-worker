@@ -132,7 +132,6 @@ def _transcribe(audio_path: Path, beam_size: int = 5, language: str = None) -> d
         str(audio_path),
         beam_size=beam_size,
         word_timestamps=True,
-        suppress_numerals=True,
         language=language,  # None = auto-detect
     )
     segments = list(segments)  # generator evalueren

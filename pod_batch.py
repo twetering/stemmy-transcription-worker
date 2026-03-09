@@ -44,7 +44,6 @@ def transcribe(model, audio_path: Path, language=None, beam_size=5) -> dict:
         str(audio_path),
         beam_size=beam_size,
         word_timestamps=True,
-        suppress_numerals=True,
         language=language,
     )
     segments = list(segments)

@@ -9,11 +9,12 @@ WORKDIR /app
 # FFmpeg for audio loading
 RUN apt-get update -y && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
 
-# Install transformers first (compatible with whisperx/pyannote Pipeline import)
-RUN pip install --no-cache-dir "transformers>=4.30.0,<4.46.0"
-
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Force compatible transformers (override base image + whisperx deps)
+# Fix: "cannot import name 'Pipeline' from 'transformers'"
+RUN pip install --no-cache-dir --force-reinstall "transformers==4.36.2"
 
 COPY rp_handler.py /app/
 

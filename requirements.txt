@@ -2,5 +2,3 @@ runpod>=1.6.0
 whisperx>=3.1.0
 faster-whisper>=1.0.0
 httpx>=0.25.0
-# Fix: "cannot import name 'Pipeline' from 'transformers'" - pin compatible version
-transformers>=4.30.0,<4.46.0

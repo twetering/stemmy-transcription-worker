@@ -103,6 +103,31 @@ def turso_insert(table: str, data: dict):
     sql = f"INSERT OR IGNORE INTO {table} ({', '.join(cols)}) VALUES ({placeholders})"
     turso_execute(sql, [data[c] for c in cols])
 
+
+def turso_pipeline_batch(statements: list, chunk_size: int = 200):
+    """
+    Voer meerdere SQL-statements uit in batches van chunk_size per HTTP-call.
+    Veel sneller dan losse calls: 465 inserts = 3 HTTP-calls i.p.v. 465.
+    statements = [{"sql": "...", "args": [...]}, ...]
+    """
+    for i in range(0, len(statements), chunk_size):
+        chunk = statements[i:i + chunk_size]
+        requests = [
+            {"type": "execute", "stmt": stmt}
+            for stmt in chunk
+        ]
+        resp = httpx.post(
+            f"{_turso_url()}/v2/pipeline",
+            headers=_turso_headers(),
+            json={"requests": requests},
+            timeout=60.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        for j, result in enumerate(data.get("results", [])):
+            if result.get("type") == "error":
+                print(f"  [warn] Turso batch insert {i+j}: {result['error']}", flush=True)
+
 # ── Audio normalisatie (identiek aan stemmy format_service) ──────────────────
 
 NORMALIZE_BITRATE = "192k"
@@ -314,54 +339,59 @@ def save_item(item_id: str, format_id: str, ep: dict,
     })
 
 def save_fragments(item_id: str, audio_url: str, transcript: dict):
-    """Importeer utterances als fragments (identiek aan _import_transcript_to_db)."""
+    """
+    Importeer utterances als fragments via Turso batch pipeline.
+    Alle inserts in zo min mogelijk HTTP-calls (chunk van 200).
+    GPU is klaar zodra transcriptie klaar is — Turso-inserts zijn non-GPU.
+    """
     utterances = transcript.get("utterances", [])
     now = _now()
-    count = 0
+    meta = json.dumps({
+        "source_info": {
+            "type": "faster-whisper",
+            "model": "large-v3-turbo",
+            "imported_at": now,
+            "total_fragments": len(utterances),
+        }
+    })
 
+    cols = [
+        "id", "item_id", "text", "start_time_seconds", "end_time_seconds",
+        "start_time", "end_time", "duration", "speaker_label", "confidence",
+        "words", "type", "source_type", "item_audio_url",
+        "order_index", "created_at", "updated_at", "metadata",
+    ]
+    placeholders = ", ".join("?" * len(cols))
+    insert_sql = f"INSERT OR IGNORE INTO fragments ({', '.join(cols)}) VALUES ({placeholders})"
+
+    statements = []
     for idx, utt in enumerate(utterances):
         start_ms = utt.get("start", 0)
         end_ms = utt.get("end", 0)
         start_s = start_ms / 1000.0 if start_ms > 1000 else float(start_ms)
         end_s = end_ms / 1000.0 if end_ms > 1000 else float(end_ms)
-        duration = end_s - start_s
+        duration = round(end_s - start_s, 3)
 
-        fragment_id = str(uuid.uuid4())
-        turso_insert("fragments", {
-            "id": fragment_id,
-            "item_id": item_id,
-            "text": utt.get("text", ""),
-            "start_time_seconds": str(start_s),
-            "end_time_seconds": str(end_s),
-            "start_time": start_ms,
-            "end_time": end_ms,
-            "duration": str(round(duration, 3)),
-            "speaker_label": utt.get("speaker", "A"),
-            "confidence": str(utt.get("confidence", 0)),
-            "words": json.dumps(utt.get("words", [])),
-            "type": "transcript",
-            "source_type": "utterances",
-            "item_audio_url": audio_url,
-            "order_index": str(idx),
-            "created_at": now,
-            "updated_at": now,
-            "metadata": json.dumps({
-                "source_info": {
-                    "type": "faster-whisper",
-                    "model": "large-v3-turbo",
-                    "imported_at": now,
-                    "total_fragments": len(utterances),
-                }
-            }),
-        })
-        count += 1
+        values = [
+            str(uuid.uuid4()), item_id, utt.get("text", ""),
+            str(start_s), str(end_s), start_ms, end_ms, str(duration),
+            utt.get("speaker", "A"), str(utt.get("confidence", 0)),
+            json.dumps(utt.get("words", [])),
+            "transcript", "utterances", audio_url,
+            str(idx), now, now, meta,
+        ]
+        statements.append({"sql": insert_sql, "args": [_val(v) for v in values]})
 
-    # Update item status
+    t0 = time.time()
+    turso_pipeline_batch(statements)
     turso_execute(
         "UPDATE items SET transcript_status = 'completed', updated_at = ? WHERE id = ?",
         [_now(), item_id]
     )
-    return count
+    turso_ms = round((time.time() - t0) * 1000)
+    print(f"  💾 {len(utterances)} fragments → Turso in {turso_ms}ms "
+          f"({len(statements)//200 + 1} HTTP-call(s))", flush=True)
+    return len(utterances)
 
 # ── RSS parse ─────────────────────────────────────────────────────────────────
 
@@ -431,6 +461,8 @@ def main():
     ap = argparse.ArgumentParser(description="Stemmy batch transcriptie pipeline")
     ap.add_argument("--rss", required=True, help="RSS feed URL")
     ap.add_argument("--limit", type=int, default=0, help="Max afleveringen (0=alles)")
+    ap.add_argument("--offset", type=int, default=0,
+                    help="Sla eerste N afleveringen over (voor parallelle pods)")
     ap.add_argument("--language", default=None,
                     help="Taalcode voor Whisper (nl/en/auto — default: auto-detect)")
     ap.add_argument("--beam-size", type=int, default=5)
@@ -440,6 +472,8 @@ def main():
                     help="Toon wat er zou gebeuren zonder iets te schrijven")
     ap.add_argument("--skip-s3", action="store_true",
                     help="Geen S3-upload (audio_url = source_url)")
+    ap.add_argument("--auto-terminate", action="store_true",
+                    help="Stop RunPod Pod automatisch na afloop (vereist RUNPOD_API_KEY + RUNPOD_POD_ID)")
     args = ap.parse_args()
 
     # Controleer vereiste env vars
@@ -454,8 +488,13 @@ def main():
     lang = args.language if args.language not in (None, "auto") else None
 
     print(f"[rss] Fetching {args.rss}...", flush=True)
-    feed_info, episodes = parse_rss(args.rss, args.limit)
-    print(f"[rss] {feed_info['title']} — {len(episodes)} afleveringen", flush=True)
+    # Haal genoeg episodes op (offset + limit)
+    fetch_limit = (args.offset + args.limit) if args.limit else 0
+    feed_info, all_episodes = parse_rss(args.rss, fetch_limit)
+    episodes = all_episodes[args.offset:] if args.offset else all_episodes
+    total_rss = len(all_episodes)
+    print(f"[rss] {feed_info['title']} — {total_rss} totaal, "
+          f"dit proces: {len(episodes)} (offset={args.offset})", flush=True)
 
     if args.dry_run:
         print("[dry-run] Geen wijzigingen. Episodes:")
@@ -534,6 +573,25 @@ def main():
     print(f"✅ Klaar: {stats['transcribed']} getranscribeerd | "
           f"{stats['skipped']} overgeslagen | {stats['failed']} mislukt")
     print(f"Format ID: {format_id}")
+
+    # Auto-terminate RunPod Pod (verspil geen geld na afloop)
+    if args.auto_terminate or os.environ.get("AUTO_TERMINATE"):
+        pod_id = os.environ.get("RUNPOD_POD_ID")
+        api_key = os.environ.get("RUNPOD_API_KEY")
+        if pod_id and api_key:
+            print(f"\n[terminate] Stopping pod {pod_id}...", flush=True)
+            try:
+                r = httpx.post(
+                    f"https://api.runpod.io/graphql?api_key={api_key}",
+                    json={"query": f'mutation {{ podTerminate(input: {{podId: "{pod_id}"}}) }}'},
+                    timeout=15.0,
+                )
+                print(f"[terminate] Response: {r.status_code}", flush=True)
+            except Exception as e:
+                print(f"[terminate] Fout: {e}", flush=True)
+        else:
+            print("[terminate] RUNPOD_POD_ID of RUNPOD_API_KEY niet gezet — pod draait door",
+                  flush=True)
 
 
 if __name__ == "__main__":

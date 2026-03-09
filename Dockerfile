@@ -12,12 +12,9 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends ffmpeg && rm
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Force compatible transformers (override base image + whisperx deps)
-# Fix: "cannot import name 'Pipeline' from 'transformers'"
-RUN pip install --no-cache-dir --force-reinstall "transformers==4.36.2"
-
-# Restore torchvision for torch 2.9 (transformers install can break pairing)
-RUN pip install --no-cache-dir --force-reinstall "torchvision>=0.24.0,<0.25"
+# Fix: whisperx 3.8+ requires transformers>=4.48 (Pipeline removed there)
+# Pin transformers 4.36 for Pipeline; do NOT reinstall torchvision (breaks torch pairing)
+RUN pip install --no-cache-dir "transformers==4.36.2"
 
 COPY rp_handler.py /app/
 

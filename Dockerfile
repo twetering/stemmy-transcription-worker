@@ -16,6 +16,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Fix: "cannot import name 'Pipeline' from 'transformers'"
 RUN pip install --no-cache-dir --force-reinstall "transformers==4.36.2"
 
+# Restore torchvision for torch 2.9 (transformers install can break pairing)
+RUN pip install --no-cache-dir --force-reinstall "torchvision>=0.24.0,<0.25"
+
 COPY rp_handler.py /app/
 
 CMD ["python", "-u", "rp_handler.py"]

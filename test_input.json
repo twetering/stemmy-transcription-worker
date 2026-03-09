@@ -1,0 +1,7 @@
+{
+  "input": {
+    "audio_url": "https://example.com/test.mp3",
+    "item_id": "test-123",
+    "batch_size": 16
+  }
+}

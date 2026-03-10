@@ -279,9 +279,30 @@ def transcribe(audio_path: str, language: str = None, beam_size: int = 5) -> dic
 
 # ── Turso import: format + item + fragments ───────────────────────────────────
 
+def _title_to_identifier(title: str) -> str:
+    """Genereer een shortname/identifier uit een format-titel.
+    Consistent met bestaande identifiers: lowercase, underscores, max 40 tekens.
+    Bijv: 'Ervaring voor Beginners' → 'ervaring_voor_beginners'
+    """
+    import re
+    s = re.sub(r"[^\w\s]", "", title.lower(), flags=re.UNICODE)
+    stopwords = {"de", "het", "een", "van", "en", "voor", "over", "bij", "op", "in",
+                 "met", "aan", "om", "uit", "the", "a", "an", "of", "and", "for"}
+    words = [w for w in s.split() if w not in stopwords] or s.split()
+    return "_".join(words[:4])[:40]
+
+
 def ensure_format(rss_url: str, title: str, description: str,
                   image_url: str, format_id: str = None) -> str:
-    """Maak format aan als het nog niet bestaat. Retourneert format_id."""
+    """
+    Maak format aan als het nog niet bestaat. Retourneert format_id.
+
+    Rules:
+    - Altijd een UUID als format ID (nooit een slug)
+    - Identifier (shortname) altijd invullen
+    - Dedupe op source_url (niet op ID — die is random)
+    - INSERT OR IGNORE: parallel pods zijn veilig
+    """
     existing = turso_execute(
         "SELECT id FROM formats WHERE source_url = ?", [rss_url]
     )
@@ -290,10 +311,25 @@ def ensure_format(rss_url: str, title: str, description: str,
         print(f"[format] Bestaand: {title} ({fid})", flush=True)
         return fid
 
-    fid = format_id or str(uuid.uuid4())
+    # Altijd UUID genereren — nooit een slug doorgeven als format_id
+    import re
+    uuid_pattern = re.compile(
+        r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+        re.IGNORECASE
+    )
+    if format_id and uuid_pattern.match(format_id):
+        fid = format_id
+    else:
+        if format_id:
+            print(f"[format] Opgegeven format_id '{format_id}' is geen UUID → nieuwe UUID gegenereerd",
+                  flush=True)
+        fid = str(uuid.uuid4())
+
+    identifier = _title_to_identifier(title)
     now = _now()
     turso_insert("formats", {
         "id": fid,
+        "identifier": identifier,
         "title": title,
         "description": description or "",
         "source_url": rss_url,
@@ -302,7 +338,7 @@ def ensure_format(rss_url: str, title: str, description: str,
         "created_at": now,
         "updated_at": now,
     })
-    print(f"[format] Nieuw: {title} ({fid})", flush=True)
+    print(f"[format] Nieuw: {title} (id={fid}, identifier={identifier})", flush=True)
     return fid
 
 def item_exists(format_id: str, source_url: str) -> tuple:
@@ -316,10 +352,14 @@ def item_exists(format_id: str, source_url: str) -> tuple:
     return None, None
 
 def has_fragments(item_id: str) -> bool:
+    """Controleer of er al fragmenten zijn voor dit item.
+    Gebruik LIMIT 1 i.p.v. COUNT(*) — stopt zodra het eerste record gevonden is.
+    Vereist idx_fragments_item_id voor snelle lookup.
+    """
     rows = turso_execute(
-        "SELECT COUNT(*) as n FROM fragments WHERE item_id = ?", [item_id]
+        "SELECT id FROM fragments WHERE item_id = ? LIMIT 1", [item_id]
     )
-    return (rows[0]["n"] or 0) > 0 if rows else False
+    return len(rows) > 0
 
 def save_item(item_id: str, format_id: str, ep: dict,
               source_url: str, audio_url: str):

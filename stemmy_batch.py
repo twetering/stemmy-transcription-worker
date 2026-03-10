@@ -76,57 +76,63 @@ def turso_execute(sql: str, params: list = None) -> list:
     if params:
         stmt["args"] = [_val(p) for p in params]
 
-    resp = httpx.post(
-        f"{_turso_url()}/v2/pipeline",
-        headers=_turso_headers(),
-        json={"requests": [{"type": "execute", "stmt": stmt}]},
-        timeout=30.0,
-    )
-    resp.raise_for_status()
-    data = resp.json()
+    for attempt in range(3):
+        try:
+            resp = httpx.post(
+                f"{_turso_url()}/v2/pipeline",
+                headers=_turso_headers(),
+                json={"requests": [{"type": "execute", "stmt": stmt}]},
+                timeout=60.0,
+            )
+            resp.raise_for_status()
+            data = resp.json()
 
-    result = data["results"][0]
-    if result.get("type") == "error":
-        raise RuntimeError(f"Turso error: {result['error']}")
+            result = data["results"][0]
+            if result.get("type") == "error":
+                raise RuntimeError(f"Turso error: {result['error']}")
 
-    rs = result.get("response", {}).get("result", {})
-    cols = [c["name"] for c in rs.get("cols", [])]
-    rows = []
-    for row in rs.get("rows", []):
-        rows.append({col: (cell["value"] if cell["type"] != "null" else None)
-                     for col, cell in zip(cols, row)})
-    return rows
+            rs = result.get("response", {}).get("result", {})
+            cols = [c["name"] for c in rs.get("cols", [])]
+            rows = []
+            for row in rs.get("rows", []):
+                rows.append({col: (cell["value"] if cell["type"] != "null" else None)
+                             for col, cell in zip(cols, row)})
+            return rows
+        except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout) as e:
+            if attempt == 2: raise
+            wait = (attempt + 1) * 5
+            print(f"  [retry] Turso execute timeout ({e}), retrying in {wait}s...", flush=True)
+            time.sleep(wait)
 
-def turso_insert(table: str, data: dict):
-    cols = list(data.keys())
-    placeholders = ", ".join("?" * len(cols))
-    sql = f"INSERT OR IGNORE INTO {table} ({', '.join(cols)}) VALUES ({placeholders})"
-    turso_execute(sql, [data[c] for c in cols])
-
-
-def turso_pipeline_batch(statements: list, chunk_size: int = 200):
+def turso_pipeline_batch(statements: list, chunk_size: int = 150):
     """
     Voer meerdere SQL-statements uit in batches van chunk_size per HTTP-call.
-    Veel sneller dan losse calls: 465 inserts = 3 HTTP-calls i.p.v. 465.
+    Veel sneller dan losse calls.
     statements = [{"sql": "...", "args": [...]}, ...]
     """
     for i in range(0, len(statements), chunk_size):
         chunk = statements[i:i + chunk_size]
-        requests = [
-            {"type": "execute", "stmt": stmt}
-            for stmt in chunk
-        ]
-        resp = httpx.post(
-            f"{_turso_url()}/v2/pipeline",
-            headers=_turso_headers(),
-            json={"requests": requests},
-            timeout=60.0,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        for j, result in enumerate(data.get("results", [])):
-            if result.get("type") == "error":
-                print(f"  [warn] Turso batch insert {i+j}: {result['error']}", flush=True)
+        requests = [{"type": "execute", "stmt": stmt} for stmt in chunk]
+        
+        for attempt in range(3):
+            try:
+                resp = httpx.post(
+                    f"{_turso_url()}/v2/pipeline",
+                    headers=_turso_headers(),
+                    json={"requests": requests},
+                    timeout=90.0,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                for j, result in enumerate(data.get("results", [])):
+                    if result.get("type") == "error":
+                        print(f"  [warn] Turso batch insert {i+j}: {result['error']}", flush=True)
+                break # Success
+            except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.WriteTimeout) as e:
+                if attempt == 2: raise
+                wait = (attempt + 1) * 5
+                print(f"  [retry] Turso batch timeout ({e}), retrying in {wait}s...", flush=True)
+                time.sleep(wait)
 
 # ── Audio normalisatie (identiek aan stemmy format_service) ──────────────────
 
